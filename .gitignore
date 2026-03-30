@@ -1,0 +1,7 @@
+*.tmp
+*.o
+
+.directory
+.simple_shell_history
+
+build/*
