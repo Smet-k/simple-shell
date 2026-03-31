@@ -6,14 +6,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 
 #define MAX_TOKENS 1000
 #define MAX_COMMANDS 100
 
 typedef struct {
+    char* output_file;
+    int append;
+} output_t;
+
+typedef struct {
     char** tokens;
     int status;
+
+    output_t custom_output;
     pid_t cmd_process; 
 } cmd_t;
 
@@ -44,11 +52,35 @@ static int execute_cmds(cmd_t* cmds, int count, char** current_dir){
 
         pid_t pid = fork();
         cmds[i].cmd_process = pid;
-        if(pid < 0) {
-            perror("fork");
-            return -1;
-        }
+  
+        
         if (!pid) {
+            if(cmds[i].custom_output.output_file) {
+                int flags = O_WRONLY | O_CREAT;
+                if (cmds[i].custom_output.append)
+                    flags |= O_APPEND;
+                else
+                    flags |= O_TRUNC;
+
+                int fd = open(cmds[i].custom_output.output_file, flags, 0644);
+                if(dup2(fd, STDOUT_FILENO) < 0){
+                    perror("dup2");
+                    exit(1);
+                }
+
+                if(dup2(fd, STDERR_FILENO) < 0){
+                    perror("dup2");
+                    exit(1);
+                }
+
+                close(fd);
+            }
+
+            if(pid < 0) {
+                perror("fork");
+                return -1;
+            }
+
             signal(SIGINT, SIG_DFL);
             execvp(*cmds[i].tokens, cmds[i].tokens);
             fprintf(stderr, "simple_shell: %s: command not found\n", *cmds[i].tokens);
@@ -67,21 +99,43 @@ static int get_tokens(char* str, cmd_t* cmd, int* cmd_count) {
     int i = 0;
 
     char* token = strtok(line, " ");
-    cmd[*cmd_count].tokens = calloc(sizeof(char), MAX_TOKENS);
+    cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
+    cmd[*cmd_count].custom_output.output_file = NULL;
+    cmd[*cmd_count].custom_output.append = 0;
     while (token) {
-        // Think of a better check, maybe move it to a function
-        if(strcmp(token, "&&") == 0){
+        if(strcmp(token, ">") == 0 || strcmp(token, ">>") == 0) {
+            int is_append = (strcmp(token, ">>") == 0);
+
+            token = strtok(NULL, " ");
+            if (!token) {
+                printf("Syntax error: no file after redirection\n");
+                return 0;
+            }
+
+            cmd[*cmd_count].custom_output.output_file = strdup(token);
+            cmd[*cmd_count].custom_output.append = is_append;
+
+            token = strtok(NULL, " ");
+            continue;
+        } else if(strcmp(token, "&&") == 0){
             cmd[(*cmd_count)++].tokens[i] = NULL;
-            cmd[*cmd_count].tokens = calloc(sizeof(char), MAX_TOKENS);
+            cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
+            cmd[*cmd_count].custom_output.output_file = NULL;
+            cmd[*cmd_count].custom_output.append = 0;
             token = strtok(NULL, " ");
             i = 0;
             continue;
-        } else if(strcmp(token, ">") == 0)
-            printf("Output redirection\n");
-        else if(strcmp(token, ">>") == 0)
-            printf("Output redirection append\n");
-        else if(strcmp(token, "||") == 0)
-            printf("Pipe\n");
+        } 
+        else if(strcmp(token, "||") == 0){
+            // TBD
+            cmd[(*cmd_count)++].tokens[i] = NULL;
+            cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
+            cmd[*cmd_count].custom_output.output_file = NULL;
+            cmd[*cmd_count].custom_output.append = 0;
+            token = strtok(NULL, " ");
+            i = 0;
+            continue;
+        }
 
         cmd[*cmd_count].tokens[i++] = token;
         token = strtok(NULL, " ");
