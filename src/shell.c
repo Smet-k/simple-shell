@@ -1,13 +1,13 @@
 #define _GNU_SOURCE
 #include "shell.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #define MAX_TOKENS 1000
 #define MAX_COMMANDS 100
@@ -22,126 +22,142 @@ typedef struct {
     int status;
 
     output_t custom_output;
-    pid_t cmd_process; 
 } cmd_t;
 
+typedef struct {
+    cmd_t cmds[MAX_COMMANDS];
+    int count;
+} pipeline_t;
+
+typedef struct {
+    pipeline_t pipelines[MAX_COMMANDS];
+    int count;
+} sequence_t;
+
 static int shell_cd(cmd_t* cmd, char** current_dir);
-static int get_tokens(char* str, cmd_t* cmd, int* cmd_count);
-static int execute_cmds(cmd_t* cmds, int count, char** current_dir);
+static int get_sequence(char* str, sequence_t* sequence);
+static int execute_sequence(sequence_t* sequence, char** current_dir);
+static void init_cmd(cmd_t* cmd);
 
 int parse_cmd(char* line, char** current_dir) {
     int count = 0;
-    cmd_t cmd[MAX_COMMANDS];
+    sequence_t sequence = {0};
     char** tokens = calloc(sizeof(char), MAX_TOKENS);
-    if(!get_tokens(line, cmd, &count))
+    if (get_sequence(line, &sequence) < 0)
         return -1;
 
-    execute_cmds(cmd, count, current_dir);
-        
+    execute_sequence(&sequence, current_dir);
     return 0;
 }
 
-static int execute_cmds(cmd_t* cmds, int count, char** current_dir){
-    for(int i = 0;i < count;i++){
-        if (strcmp(*cmds[i].tokens, "cd") == 0) {
-            shell_cd(&cmds[i], current_dir);
-            return 0;
-        } else if (strcmp(*cmds[i].tokens, "exit") == 0) {
-            exit(0);
-        }
+static int execute_sequence(sequence_t* sequence, char** current_dir) {
+    for (int si = 0; si < sequence->count; si++) {
+        pipeline_t* pl = &sequence->pipelines[si];
+        for (int pi = 0; pi < pl->count; pi++) {
+            cmd_t* cmd = &pl->cmds[pi];
 
-        pid_t pid = fork();
-        cmds[i].cmd_process = pid;
-  
-        
-        if (!pid) {
-            if(cmds[i].custom_output.output_file) {
-                int flags = O_WRONLY | O_CREAT;
-                if (cmds[i].custom_output.append)
-                    flags |= O_APPEND;
-                else
-                    flags |= O_TRUNC;
+            if (strcmp(*cmd->tokens, "cd") == 0) {
+                shell_cd(cmd, current_dir);
+                return 0;
+            } else if (strcmp(*cmd->tokens, "exit") == 0)
+                exit(0);
 
-                int fd = open(cmds[i].custom_output.output_file, flags, 0644);
-                if(dup2(fd, STDOUT_FILENO) < 0){
-                    perror("dup2");
-                    exit(1);
+            pid_t pid = fork();
+
+            if (!pid) {
+                if (cmd->custom_output.output_file) {
+                    int flags = O_WRONLY | O_CREAT;
+                    if (cmd->custom_output.append)
+                        flags |= O_APPEND;
+                    else
+                        flags |= O_TRUNC;
+
+                    int fd = open(cmd->custom_output.output_file, flags, 0644);
+                    if (dup2(fd, STDOUT_FILENO) < 0) {
+                        perror("dup2");
+                        exit(1);
+                    }
+
+                    if (dup2(fd, STDERR_FILENO) < 0) {
+                        perror("dup2");
+                        exit(1);
+                    }
+
+                    close(fd);
                 }
 
-                if(dup2(fd, STDERR_FILENO) < 0){
-                    perror("dup2");
-                    exit(1);
-                }
-
-                close(fd);
+                signal(SIGINT, SIG_DFL);
+                execvp(*cmd->tokens, cmd->tokens);
+                fprintf(stderr, "simple_shell: %s: command not found\n", *cmd->tokens);
+                exit(127);
+            } else {
+                waitpid(pid, &cmd->status, 0);
+                if (cmd->status != 0) return -1;
             }
-
-            if(pid < 0) {
-                perror("fork");
-                return -1;
-            }
-
-            signal(SIGINT, SIG_DFL);
-            execvp(*cmds[i].tokens, cmds[i].tokens);
-            fprintf(stderr, "simple_shell: %s: command not found\n", *cmds[i].tokens);
-            return -1;
-        } else {
-            waitpid(cmds[i].cmd_process, &cmds[i].status, 0);
-            if(cmds[i].status != 0) return -1;
         }
     }
     return 0;
 }
 
-static int get_tokens(char* str, cmd_t* cmd, int* cmd_count) {
+
+// sequence:
+//   pipeline[0]:
+//     cmd[0]: ls -l
+//     cmd[1]: grep txt
+
+//   pipeline[1]:
+//     cmd[0]: echo done
+static int get_sequence(char* str, sequence_t* sequence) {
     char* line = strdup(str);
-    *cmd_count = 0;
+    sequence->count = 0;
+
+    pipeline_t* pl = &sequence->pipelines[0];
+    pl->count = 0;
+
+    cmd_t cmd;
+    init_cmd(&cmd);
     int i = 0;
 
     char* token = strtok(line, " ");
-    cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
-    cmd[*cmd_count].custom_output.output_file = NULL;
-    cmd[*cmd_count].custom_output.append = 0;
+
     while (token) {
-        if(strcmp(token, ">") == 0 || strcmp(token, ">>") == 0) {
-            int is_append = (strcmp(token, ">>") == 0);
+        if (strcmp(token, ">") == 0 || strcmp(token, ">>") == 0) {
+            const int is_append = (strcmp(token, ">>") == 0);
 
             token = strtok(NULL, " ");
             if (!token) {
                 printf("Syntax error: no file after redirection\n");
-                return 0;
+                return -1;
             }
 
-            cmd[*cmd_count].custom_output.output_file = strdup(token);
-            cmd[*cmd_count].custom_output.append = is_append;
+            cmd.custom_output.output_file = strdup(token);
+            cmd.custom_output.append = is_append;
 
             token = strtok(NULL, " ");
-            continue;
-        } else if(strcmp(token, "&&") == 0){
-            cmd[(*cmd_count)++].tokens[i] = NULL;
-            cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
-            cmd[*cmd_count].custom_output.output_file = NULL;
-            cmd[*cmd_count].custom_output.append = 0;
-            token = strtok(NULL, " ");
+        } else if (strcmp(token, "&&") == 0) {
+            cmd.tokens[i] = NULL;
+            pl->cmds[pl->count++] = cmd;
+
+            sequence->count++;
+            pl = &sequence->pipelines[sequence->count++];
+            pl->count = 0;
+
+            init_cmd(&cmd);
             i = 0;
+        } else if (strcmp(token, "|") == 0) {
+            i++;
             continue;
-        } 
-        else if(strcmp(token, "||") == 0){
-            // TBD
-            cmd[(*cmd_count)++].tokens[i] = NULL;
-            cmd[*cmd_count].tokens = calloc(MAX_TOKENS, sizeof(char*));
-            cmd[*cmd_count].custom_output.output_file = NULL;
-            cmd[*cmd_count].custom_output.append = 0;
-            token = strtok(NULL, " ");
-            i = 0;
-            continue;
+        }  // TBD
+        else {
+            cmd.tokens[i++] = token;
         }
 
-        cmd[*cmd_count].tokens[i++] = token;
         token = strtok(NULL, " ");
     }
-    cmd[(*cmd_count)++].tokens[i] = NULL;
-    return i;
+    cmd.tokens[i] = NULL;
+    pl->cmds[pl->count++] = cmd;
+    sequence->count++;
+    return 0;
 }
 
 static int shell_cd(cmd_t* cmd, char** current_dir) {
@@ -158,5 +174,10 @@ static int shell_cd(cmd_t* cmd, char** current_dir) {
     return 0;
 }
 
-
+static void init_cmd(cmd_t* cmd) {
+    *cmd = (cmd_t){0};
+    cmd->tokens = calloc(MAX_TOKENS, sizeof(char*));
+    cmd->custom_output.output_file = NULL;
+    cmd->custom_output.append = 0;
+}
 
