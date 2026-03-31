@@ -9,6 +9,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// TBD - (echo hello && echo world) >> test.txt 
+
 #define MAX_TOKENS 1000
 #define MAX_COMMANDS 100
 
@@ -53,6 +55,7 @@ int parse_cmd(char* line, char** current_dir) {
 static int execute_sequence(sequence_t* sequence, char** current_dir) {
     for (int si = 0; si < sequence->count; si++) {
         pipeline_t* pl = &sequence->pipelines[si];
+        int prev_read = -1;
         for (int pi = 0; pi < pl->count; pi++) {
             cmd_t* cmd = &pl->cmds[pi];
 
@@ -62,9 +65,29 @@ static int execute_sequence(sequence_t* sequence, char** current_dir) {
             } else if (strcmp(*cmd->tokens, "exit") == 0)
                 exit(0);
 
+            int fd[2];
+
+            if (pi < pl->count - 1) {
+                if (pipe(fd) < 0) {
+                    perror("pipe");
+                    exit(1);
+                }
+            }
             pid_t pid = fork();
 
             if (!pid) {
+                
+                if(prev_read != -1) {
+                    dup2(prev_read, STDIN_FILENO);
+                    close(prev_read);
+                }
+
+                if(pi < pl->count - 1) {
+                    dup2(fd[1], STDOUT_FILENO);
+                    close(fd[0]);
+                    close(fd[1]);
+                }
+
                 if (cmd->custom_output.output_file) {
                     int flags = O_WRONLY | O_CREAT;
                     if (cmd->custom_output.append)
@@ -72,41 +95,41 @@ static int execute_sequence(sequence_t* sequence, char** current_dir) {
                     else
                         flags |= O_TRUNC;
 
-                    int fd = open(cmd->custom_output.output_file, flags, 0644);
-                    if (dup2(fd, STDOUT_FILENO) < 0) {
+                    int outfd = open(cmd->custom_output.output_file, flags, 0644);
+                    if (dup2(outfd, STDOUT_FILENO) < 0) {
                         perror("dup2");
                         exit(1);
                     }
 
-                    if (dup2(fd, STDERR_FILENO) < 0) {
+                    if (dup2(outfd, STDERR_FILENO) < 0) {
                         perror("dup2");
                         exit(1);
                     }
 
-                    close(fd);
+                    close(outfd);
                 }
 
                 signal(SIGINT, SIG_DFL);
                 execvp(*cmd->tokens, cmd->tokens);
                 fprintf(stderr, "simple_shell: %s: command not found\n", *cmd->tokens);
                 exit(127);
-            } else {
-                waitpid(pid, &cmd->status, 0);
-                if (cmd->status != 0) return -1;
             }
+            
+            if(prev_read != -1)
+                close(prev_read);
+            
+            if(pi < pl->count - 1) {
+                close(fd[1]);
+                prev_read = fd[0];
+            }
+
         }
+        for (int i = 0; i < pl->count; i++)
+            wait(NULL);
     }
     return 0;
 }
 
-
-// sequence:
-//   pipeline[0]:
-//     cmd[0]: ls -l
-//     cmd[1]: grep txt
-
-//   pipeline[1]:
-//     cmd[0]: echo done
 static int get_sequence(char* str, sequence_t* sequence) {
     char* line = strdup(str);
     sequence->count = 0;
@@ -145,10 +168,12 @@ static int get_sequence(char* str, sequence_t* sequence) {
             init_cmd(&cmd);
             i = 0;
         } else if (strcmp(token, "|") == 0) {
-            i++;
-            continue;
-        }  // TBD
-        else {
+            cmd.tokens[i] = NULL;
+            pl->cmds[pl->count++] = cmd;
+
+            init_cmd(&cmd);
+            i = 0;
+        } else {
             cmd.tokens[i++] = token;
         }
 
@@ -180,4 +205,3 @@ static void init_cmd(cmd_t* cmd) {
     cmd->custom_output.output_file = NULL;
     cmd->custom_output.append = 0;
 }
-
